@@ -666,7 +666,7 @@ class Preprocessor(object):
     #
     # Parse an input string/
     # ----------------------------------------------------------------------
-    def parsegen(self,input,source=None):
+    def parsegen(self,input,source=None,path_prefix="",is_global=False):
 
         # Replace trigraph sequences
         t = trigraph(input)
@@ -678,6 +678,8 @@ class Preprocessor(object):
         self.define("__FILE__ \"%s\"" % source)
 
         self.source = source
+        self.path_prefix = path_prefix
+        self.is_global = is_global
         chunk = []
         enable = True
         iftrigger = False
@@ -718,6 +720,8 @@ class Preprocessor(object):
                             yield tok
                         self.macros['__FILE__'] = oldfile
                         self.source = source
+                        self.path_prefix = path_prefix
+                        self.is_global = is_global
                 elif name == 'undef':
                     if enable:
                         for tok in self.expand_macros(chunk):
@@ -831,23 +835,72 @@ class Preprocessor(object):
                 data = self.read_include_file(iname)
 
                 if "on_include" in dir(self):
-                    self.on_include(self.source, filename, is_global)
+                    self.on_include(self.rel_path, p, filename, is_global)
+
+                """
+There are two different implementation known of approach to search for
+quoted (") inclusions:
+
+MSVC:
+https://docs.microsoft.com/en-us/cpp/preprocessor/hash-include-directive-c-cpp?view=msvc-170
+
+```
+The preprocessor searches for include files in this order:
+
+1) In the same directory as the file that contains the #include statement.
+
+2) In the directories of the currently opened include files, in the reverse order in which they were opened. The search begins in the directory of the parent include file and continues upward through the directories of any grandparent include files.
+
+3) Along the path that's specified by each /I compiler option.
+
+4) Along the paths that are specified by the INCLUDE environment variable.
+```
+
+GCC:
+https://gcc.gnu.org/onlinedocs/cpp/Search-Path.html
+
+```
+By default, the preprocessor looks for header files included by the quote
+form of the directive #include "file" first relative to the directory of
+the current file, and then in a preconfigured list of standard system
+directories. For example, if /usr/include/sys/stat.h contains
+#include "types.h", GCC looks for types.h first in /usr/include/sys,
+then in its usual search path.
+```
+
+I.e. GCC ignores inclusion chain. Only directory of includer is searched for
+file being included.
+We use the same approach because Qemu uses GCC.
+                """
 
                 dname = os.path.dirname(iname)
+                prev_temp_path = list(self.temp_path)
                 if dname:
-                    self.temp_path.insert(0,dname)
-                for tok in self.parsegen(data,filename):
+                    self.temp_path = [dname]
+                else:
+                    self.temp_path = ["."]
+                for tok in self.parsegen(data,filename,p,is_global):
                     yield tok
-                if dname:
-                    del self.temp_path[0]
+                self.temp_path = prev_temp_path
                 break
             except IOError:
                 pass
         else:
             print("Couldn't find '%s'" % filename)
 
-            if "all_inclusions" in dir(self) and self.all_inclusions and "on_include" in dir(self):
-                self.on_include(self.source, filename, is_global)
+            if "all_inclusions" in dir(self) \
+            and self.all_inclusions \
+            and "on_include" in dir(self):
+                self.on_include(self.rel_path, "", filename, is_global)
+
+    @property
+    def rel_path(self):
+        if self.is_global:
+            return self.source
+        if self.path_prefix:
+            return os.path.join(self.path_prefix, self.source)
+        else:
+            return self.source
 
     # ----------------------------------------------------------------------
     # read_include_file()
@@ -890,7 +943,7 @@ class Preprocessor(object):
 
                 if "source" in dir(self):
                     for cb in self.on_define:
-                        cb(self.source, m)
+                        cb(self.rel_path, m)
 
             elif mtype.type in self.t_WS:
                 # A normal macro
@@ -899,7 +952,7 @@ class Preprocessor(object):
 
                 if "source" in dir(self):
                     for cb in self.on_define:
-                        cb(self.source, m)
+                        cb(self.rel_path, m)
 
             elif mtype.value == '(':
                 # A macro with arguments
@@ -945,7 +998,7 @@ class Preprocessor(object):
 
                 if "source" in dir(self):
                     for cb in self.on_define:
-                        cb(self.source, m)
+                        cb(self.rel_path, m)
             else:
                 print("Bad macro definition")
         except LookupError:
